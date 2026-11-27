@@ -1,4 +1,4 @@
-import { google } from "googleapis";
+import { google, drive_v3 } from "googleapis";
 import { createClient } from "@supabase/supabase-js";
 
 export function getDriveClient() {
@@ -15,7 +15,6 @@ export function getDriveClient() {
   return google.drive({ version: "v3", auth: oauth2Client });
 }
 
-// Verifies the user's Supabase session token from the request header
 export async function getAuthenticatedUser(req: Request) {
   const authHeader = req.headers.get("authorization");
   if (!authHeader?.startsWith("Bearer ")) return null;
@@ -32,7 +31,6 @@ export async function getAuthenticatedUser(req: Request) {
   return data.user;
 }
 
-// Finds or creates a folder named after the user's email inside your root Drive folder
 export async function getOrCreateUserFolder(email: string) {
   const drive = getDriveClient();
   const rootFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID!;
@@ -58,4 +56,27 @@ export async function getOrCreateUserFolder(email: string) {
   });
 
   return created.data.id!;
+}
+
+// Walks up parent folders to verify an item belongs strictly to this user
+export async function isInsideUserFolder(
+  drive: drive_v3.Drive,
+  itemId: string,
+  userRootFolderId: string
+): Promise<boolean> {
+  if (itemId === userRootFolderId) return true;
+
+  let currentId: string | undefined = itemId;
+  for (let depth = 0; depth < 20 && currentId; depth++) {
+    const res: { data: drive_v3.Schema$File } = await drive.files.get({
+      fileId: currentId,
+      fields: "parents",
+    });
+    const parents: string[] | null | undefined = res.data.parents;
+    if (!parents || parents.length === 0) return false;
+    if (parents.includes(userRootFolderId)) return true;
+    currentId = parents[0];
+  }
+
+  return false;
 }

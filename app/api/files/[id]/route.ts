@@ -3,6 +3,7 @@ import {
   getAuthenticatedUser,
   getDriveClient,
   getOrCreateUserFolder,
+  isInsideUserFolder,
 } from "@/lib/drive";
 
 export async function GET(
@@ -17,16 +18,23 @@ export async function GET(
 
     const { id } = await context.params;
     const drive = getDriveClient();
-    const userFolderId = await getOrCreateUserFolder(user.email);
+    const userRootFolderId = await getOrCreateUserFolder(user.email);
+
+    const allowed = await isInsideUserFolder(drive, id, userRootFolderId);
+    if (!allowed || id === userRootFolderId) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
 
     const meta = await drive.files.get({
       fileId: id,
-      fields: "name, mimeType, parents",
+      fields: "name, mimeType",
     });
 
-    // Block access if the file is not inside this user's folder
-    if (!meta.data.parents?.includes(userFolderId)) {
-      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    if (meta.data.mimeType === "application/vnd.google-apps.folder") {
+      return NextResponse.json(
+        { error: "Cannot download a folder directly" },
+        { status: 400 }
+      );
     }
 
     const fileRes = await drive.files.get(
@@ -61,15 +69,10 @@ export async function DELETE(
 
     const { id } = await context.params;
     const drive = getDriveClient();
-    const userFolderId = await getOrCreateUserFolder(user.email);
+    const userRootFolderId = await getOrCreateUserFolder(user.email);
 
-    const meta = await drive.files.get({
-      fileId: id,
-      fields: "parents",
-    });
-
-    // Block deletion if the file is not inside this user's folder
-    if (!meta.data.parents?.includes(userFolderId)) {
+    const allowed = await isInsideUserFolder(drive, id, userRootFolderId);
+    if (!allowed || id === userRootFolderId) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
