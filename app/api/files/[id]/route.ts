@@ -1,18 +1,33 @@
 import { NextResponse } from "next/server";
-import { getDriveClient } from "@/lib/drive";
+import {
+  getAuthenticatedUser,
+  getDriveClient,
+  getOrCreateUserFolder,
+} from "@/lib/drive";
 
 export async function GET(
-  _req: Request,
+  req: Request,
   context: { params: Promise<{ id: string }> }
 ) {
   try {
+    const user = await getAuthenticatedUser(req);
+    if (!user?.email) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
     const { id } = await context.params;
     const drive = getDriveClient();
+    const userFolderId = await getOrCreateUserFolder(user.email);
 
     const meta = await drive.files.get({
       fileId: id,
-      fields: "name, mimeType",
+      fields: "name, mimeType, parents",
     });
+
+    // Block access if the file is not inside this user's folder
+    if (!meta.data.parents?.includes(userFolderId)) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
 
     const fileRes = await drive.files.get(
       { fileId: id, alt: "media" },
@@ -35,12 +50,28 @@ export async function GET(
 }
 
 export async function DELETE(
-  _req: Request,
+  req: Request,
   context: { params: Promise<{ id: string }> }
 ) {
   try {
+    const user = await getAuthenticatedUser(req);
+    if (!user?.email) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
     const { id } = await context.params;
     const drive = getDriveClient();
+    const userFolderId = await getOrCreateUserFolder(user.email);
+
+    const meta = await drive.files.get({
+      fileId: id,
+      fields: "parents",
+    });
+
+    // Block deletion if the file is not inside this user's folder
+    if (!meta.data.parents?.includes(userFolderId)) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
 
     await drive.files.delete({ fileId: id });
     return NextResponse.json({ success: true });
