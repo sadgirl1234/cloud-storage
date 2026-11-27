@@ -9,7 +9,11 @@ const supabase = createClient(
 );
 
 const FOLDER_MIME = "application/vnd.google-apps.folder";
-const FLOWERS = ["🌸", "🌺", "🌼", "🌷", "🌻", "💐", "🪷"];
+const FLOWERS = ["🌸", "🌺", "🌹", "🌷", "💐", "🪷", "❤️"];
+
+const MAX_FILES_AT_ONCE = 5;
+const MAX_SINGLE_FILE_BYTES = 70 * 1024 * 1024; // 70 MB
+const MAX_TOTAL_BATCH_BYTES = 150 * 1024 * 1024; // 150 MB
 
 type DriveItem = {
   id: string;
@@ -24,6 +28,15 @@ type Breadcrumb = {
   name: string;
 };
 
+type UploadTask = {
+  id: string;
+  name: string;
+  size: number;
+  progress: number;
+  status: "uploading" | "done" | "error";
+  error?: string;
+};
+
 type FlowerParticle = {
   id: number;
   x: number;
@@ -34,7 +47,7 @@ type FlowerParticle = {
   emoji: string;
 };
 
-function formatBytes(bytes?: string) {
+function formatBytes(bytes?: string | number) {
   const num = Number(bytes || 0);
   if (num === 0) return "0 B";
   const sizes = ["B", "KB", "MB", "GB"];
@@ -54,10 +67,11 @@ export default function Home() {
   const [breadcrumbs, setBreadcrumbs] = useState<Breadcrumb[]>([]);
   const [currentFolderId, setCurrentFolderId] = useState<string>("");
 
-  // Files state
+  // Files & multi-upload state
   const [items, setItems] = useState<DriveItem[]>([]);
   const [loadingFiles, setLoadingFiles] = useState(false);
-  const [uploading, setUploading] = useState(false);
+  const [uploadTasks, setUploadTasks] = useState<UploadTask[]>([]);
+  const [uploadError, setUploadError] = useState("");
 
   // Modals: New Folder & Create Online File
   const [showFolderModal, setShowFolderModal] = useState(false);
@@ -69,7 +83,7 @@ export default function Home() {
   const [newFileContent, setNewFileContent] = useState("");
   const [creatingFile, setCreatingFile] = useState(false);
 
-  // Flower burst particles on every click & touch
+  // Flower burst on every click & touch
   const [flowers, setFlowers] = useState<FlowerParticle[]>([]);
 
   useEffect(() => {
@@ -172,28 +186,136 @@ export default function Home() {
     fetchFiles(session.access_token, target.id);
   };
 
-  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files?.[0];
-    if (!selected || !session) return;
+  const uploadSingleFile = async (
+    file: File,
+    taskId: string,
+    accessToken: string
+  ) => {
+    try {
+      // 1. Get direct resumable upload URL from our backend
+      const initRes = await fetch("/api/files", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          action: "init_upload",
+          name: file.name,
+          mimeType: file.type || "application/octet-stream",
+          size: file.size,
+          parentId: currentFolderId,
+        }),
+      });
 
-    setUploading(true);
-    const formData = new FormData();
-    formData.append("file", selected);
-    if (currentFolderId) formData.append("folderId", currentFolderId);
+      const initData = await initRes.json();
+      if (!initRes.ok || !initData.uploadUrl) {
+        throw new Error(initData.error || "Failed to start upload");
+      }
 
-    const res = await fetch("/api/files", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${session.access_token}` },
-      body: formData,
-    });
+      // 2. Upload directly to Google Drive with live progress percentage
+      await new Promise<void>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("PUT", initData.uploadUrl);
+        xhr.setRequestHeader(
+          "Content-Type",
+          file.type || "application/octet-stream"
+        );
 
-    if (res.ok) {
-      await fetchFiles(session.access_token, currentFolderId);
-    } else {
-      alert("Upload failed. Make sure the file is under 4 MB on Vercel.");
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) {
+            const percent = Math.round((event.loaded / event.total) * 100);
+            setUploadTasks((prev) =>
+              prev.map((t) =>
+                t.id === taskId ? { ...t, progress: percent } : t
+              )
+            );
+          }
+        };
+
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            setUploadTasks((prev) =>
+              prev.map((t) =>
+                t.id === taskId ? { ...t, progress: 100, status: "done" } : t
+              )
+            );
+            resolve();
+          } else {
+            reject(new Error(`Upload failed (${xhr.status})`));
+          }
+        };
+
+        xhr.onerror = () => reject(new Error("Network error during upload"));
+        xhr.send(file);
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Upload failed";
+      setUploadTasks((prev) =>
+        prev.map((t) =>
+          t.id === taskId ? { ...t, status: "error", error: msg } : t
+        )
+      );
     }
-    setUploading(false);
+  };
+
+  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = Array.from(e.target.files || []);
     e.target.value = "";
+    if (!selectedFiles.length || !session) return;
+
+    setUploadError("");
+
+    // Rule 1: Maximum 5 files at once
+    if (selectedFiles.length > MAX_FILES_AT_ONCE) {
+      setUploadError(
+        `You can upload a maximum of ${MAX_FILES_AT_ONCE} files at once (you selected ${selectedFiles.length}).`
+      );
+      return;
+    }
+
+    // Rule 2: Maximum 70 MB per single file
+    const oversizedFile = selectedFiles.find(
+      (f) => f.size > MAX_SINGLE_FILE_BYTES
+    );
+    if (oversizedFile) {
+      setUploadError(
+        `"${oversizedFile.name}" is ${formatBytes(
+          oversizedFile.size
+        )}. Maximum allowed per single file is 70 MB.`
+      );
+      return;
+    }
+
+    // Rule 3: Maximum 150 MB total at once
+    const totalBatchSize = selectedFiles.reduce((sum, f) => sum + f.size, 0);
+    if (totalBatchSize > MAX_TOTAL_BATCH_BYTES) {
+      setUploadError(
+        `Total selected size is ${formatBytes(
+          totalBatchSize
+        )}. Maximum allowed in one upload is 150 MB.`
+      );
+      return;
+    }
+
+    const newTasks: UploadTask[] = selectedFiles.map((file, idx) => ({
+      id: `${Date.now()}-${idx}-${file.name}`,
+      name: file.name,
+      size: file.size,
+      progress: 0,
+      status: "uploading",
+    }));
+
+    setUploadTasks(newTasks);
+
+    // Upload all selected files at the same time
+    await Promise.all(
+      selectedFiles.map((file, idx) =>
+        uploadSingleFile(file, newTasks[idx].id, session.access_token)
+      )
+    );
+
+    await fetchFiles(session.access_token, currentFolderId);
   };
 
   const handleCreateFolder = async (e: React.FormEvent) => {
@@ -274,7 +396,8 @@ export default function Home() {
 
   const handleDelete = async (item: DriveItem) => {
     if (!session) return;
-    const label = item.mimeType === FOLDER_MIME ? "folder and its contents" : "file";
+    const label =
+      item.mimeType === FOLDER_MIME ? "folder and its contents" : "file";
     if (!confirm(`Delete this ${label}: "${item.name}"?`)) return;
 
     const res = await fetch(`/api/files/${item.id}`, {
@@ -285,6 +408,8 @@ export default function Home() {
       setItems((prev) => prev.filter((f) => f.id !== item.id));
     }
   };
+
+  const isUploadingAny = uploadTasks.some((t) => t.status === "uploading");
 
   const flowerOverlay = (
     <>
@@ -334,32 +459,32 @@ export default function Home() {
 
   if (!authReady) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-sky-50 via-white to-rose-50 text-slate-600 flex flex-col items-center justify-between p-6">
+      <div className="min-h-screen bg-gradient-to-br from-pink-50 via-rose-50 to-red-50 text-rose-600 flex flex-col items-center justify-between p-6">
         {flowerOverlay}
         <div className="my-auto text-sm font-medium">Loading CloudVault...</div>
-        <footer className="text-xs text-slate-500">made with Love</footer>
+        <footer className="text-xs text-rose-500">made with Love</footer>
       </div>
     );
   }
 
-  // Light & Colorful Google-only Login Screen
+  // Pink & Red Light Google-only Login Screen
   if (!session) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-sky-100 via-indigo-50 to-pink-100 text-slate-800 flex flex-col justify-between p-4">
+      <div className="min-h-screen bg-gradient-to-br from-pink-100 via-rose-50 to-red-100 text-rose-950 flex flex-col justify-between p-4">
         {flowerOverlay}
-        <div className="my-auto mx-auto w-full max-w-md bg-white/90 backdrop-blur-md border border-white shadow-xl shadow-indigo-100/70 rounded-3xl p-8 text-center">
-          <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-gradient-to-tr from-sky-500 via-indigo-500 to-pink-500 flex items-center justify-center text-3xl shadow-md">
+        <div className="my-auto mx-auto w-full max-w-md bg-white/90 backdrop-blur-md border border-pink-200 shadow-xl shadow-rose-200/60 rounded-3xl p-8 text-center">
+          <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-gradient-to-tr from-pink-500 via-rose-500 to-red-500 flex items-center justify-center text-3xl shadow-md">
             ☁️
           </div>
-          <h1 className="text-2xl font-bold bg-gradient-to-r from-sky-600 via-indigo-600 to-pink-600 bg-clip-text text-transparent mb-2">
+          <h1 className="text-2xl font-bold bg-gradient-to-r from-pink-600 via-rose-600 to-red-600 bg-clip-text text-transparent mb-2">
             CloudVault
           </h1>
-          <p className="text-sm text-slate-500 mb-8">
-            Sign in with Google to open your private, colorful cloud workspace
+          <p className="text-sm text-rose-600/80 mb-8">
+            Sign in with Google to open your private cloud workspace
           </p>
 
           {authMessage && (
-            <p className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-xl p-3 mb-4">
+            <p className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-xl p-3 mb-4">
               {authMessage}
             </p>
           )}
@@ -368,7 +493,7 @@ export default function Home() {
             type="button"
             disabled={authLoading}
             onClick={handleGoogleLogin}
-            className="w-full bg-white hover:bg-slate-50 border border-slate-200 shadow-sm text-slate-800 text-sm font-semibold py-3.5 rounded-xl flex items-center justify-center gap-3 transition cursor-pointer"
+            className="w-full bg-white hover:bg-rose-50 border border-pink-200 shadow-sm text-rose-900 text-sm font-semibold py-3.5 rounded-xl flex items-center justify-center gap-3 transition cursor-pointer"
           >
             <svg className="w-5 h-5" viewBox="0 0 24 24">
               <path
@@ -392,14 +517,13 @@ export default function Home() {
           </button>
         </div>
 
-        <footer className="text-center text-xs font-medium text-slate-500 py-3">
+        <footer className="text-center text-xs font-medium text-rose-500 py-3">
           made with Love
         </footer>
       </div>
     );
   }
 
-  // Filter items based on navigation pane selection
   const visibleItems = items.filter((item) => {
     const isFolder = item.mimeType === FOLDER_MIME;
     if (activeNav === "folders") return isFolder;
@@ -412,7 +536,7 @@ export default function Home() {
   const usedPercent = Math.min((totalBytes / (15 * 1024 ** 3)) * 100, 100);
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-sky-50 via-white to-rose-50 text-slate-800 flex flex-col">
+    <div className="min-h-screen bg-gradient-to-br from-pink-50 via-rose-50/70 to-red-50 text-rose-950 flex flex-col">
       {flowerOverlay}
 
       <div className="flex flex-1">
@@ -420,21 +544,21 @@ export default function Home() {
         <aside
           className={`${
             mobileNavOpen ? "fixed inset-y-0 left-0 z-40 flex" : "hidden"
-          } md:flex w-64 bg-white/90 backdrop-blur-md border-r border-indigo-100 p-6 flex-col justify-between shadow-sm`}
+          } md:flex w-64 bg-white/90 backdrop-blur-md border-r border-pink-200 p-6 flex-col justify-between shadow-sm`}
         >
           <div>
             <div className="flex items-center justify-between mb-2">
-              <h1 className="text-xl font-extrabold bg-gradient-to-r from-sky-600 via-indigo-600 to-pink-600 bg-clip-text text-transparent">
+              <h1 className="text-xl font-extrabold bg-gradient-to-r from-pink-600 via-rose-600 to-red-600 bg-clip-text text-transparent">
                 ☁️ CloudVault
               </h1>
               <button
                 onClick={() => setMobileNavOpen(false)}
-                className="md:hidden text-slate-400 hover:text-slate-700 text-lg"
+                className="md:hidden text-rose-400 hover:text-rose-700 text-lg"
               >
                 ✕
               </button>
             </div>
-            <p className="text-xs text-slate-500 truncate mb-6">
+            <p className="text-xs text-rose-500 truncate mb-6">
               {session.user.email}
             </p>
 
@@ -445,7 +569,7 @@ export default function Home() {
                   setShowFolderModal(true);
                   setMobileNavOpen(false);
                 }}
-                className="w-full bg-gradient-to-r from-amber-400 to-orange-400 hover:from-amber-500 hover:to-orange-500 text-white text-xs font-semibold py-2.5 px-3 rounded-xl shadow-sm transition cursor-pointer"
+                className="w-full bg-gradient-to-r from-pink-500 to-rose-500 hover:from-pink-600 hover:to-rose-600 text-white text-xs font-semibold py-2.5 px-3 rounded-xl shadow-sm transition cursor-pointer"
               >
                 📁 + New Folder
               </button>
@@ -454,7 +578,7 @@ export default function Home() {
                   setShowFileModal(true);
                   setMobileNavOpen(false);
                 }}
-                className="w-full bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white text-xs font-semibold py-2.5 px-3 rounded-xl shadow-sm transition cursor-pointer"
+                className="w-full bg-gradient-to-r from-rose-500 to-red-500 hover:from-rose-600 hover:to-red-600 text-white text-xs font-semibold py-2.5 px-3 rounded-xl shadow-sm transition cursor-pointer"
               >
                 ✍️ + Create File Online
               </button>
@@ -470,8 +594,8 @@ export default function Home() {
                 }}
                 className={`w-full text-left px-3.5 py-2.5 rounded-xl font-medium transition cursor-pointer ${
                   activeNav === "all"
-                    ? "bg-indigo-50 text-indigo-700 border border-indigo-100"
-                    : "text-slate-600 hover:bg-slate-100"
+                    ? "bg-rose-100 text-rose-800 border border-rose-200"
+                    : "text-rose-700/80 hover:bg-pink-50"
                 }`}
               >
                 🏠 My Drive
@@ -483,8 +607,8 @@ export default function Home() {
                 }}
                 className={`w-full text-left px-3.5 py-2.5 rounded-xl font-medium transition cursor-pointer ${
                   activeNav === "folders"
-                    ? "bg-amber-50 text-amber-700 border border-amber-100"
-                    : "text-slate-600 hover:bg-slate-100"
+                    ? "bg-pink-100 text-pink-800 border border-pink-200"
+                    : "text-rose-700/80 hover:bg-pink-50"
                 }`}
               >
                 📂 Folders Only
@@ -496,8 +620,8 @@ export default function Home() {
                 }}
                 className={`w-full text-left px-3.5 py-2.5 rounded-xl font-medium transition cursor-pointer ${
                   activeNav === "files"
-                    ? "bg-pink-50 text-pink-700 border border-pink-100"
-                    : "text-slate-600 hover:bg-slate-100"
+                    ? "bg-red-100 text-red-800 border border-red-200"
+                    : "text-rose-700/80 hover:bg-pink-50"
                 }`}
               >
                 📄 Files Only
@@ -506,14 +630,14 @@ export default function Home() {
           </div>
 
           <div className="space-y-4">
-            <div className="bg-gradient-to-br from-sky-50 to-indigo-50 border border-indigo-100 rounded-2xl p-4">
-              <div className="flex justify-between text-xs text-slate-600 font-medium mb-2">
+            <div className="bg-gradient-to-br from-pink-50 to-red-50 border border-pink-200 rounded-2xl p-4">
+              <div className="flex justify-between text-xs text-rose-700 font-medium mb-2">
                 <span>Folder Usage</span>
                 <span>{usedGB} GB</span>
               </div>
-              <div className="w-full bg-white h-2.5 rounded-full overflow-hidden border border-indigo-100">
+              <div className="w-full bg-white h-2.5 rounded-full overflow-hidden border border-pink-200">
                 <div
-                  className="bg-gradient-to-r from-sky-500 via-indigo-500 to-pink-500 h-full transition-all"
+                  className="bg-gradient-to-r from-pink-500 via-rose-500 to-red-600 h-full transition-all"
                   style={{ width: `${Math.max(usedPercent, 4)}%` }}
                 />
               </div>
@@ -521,7 +645,7 @@ export default function Home() {
 
             <button
               onClick={handleSignOut}
-              className="w-full text-xs font-semibold text-rose-600 hover:bg-rose-50 border border-rose-200 py-2.5 rounded-xl transition cursor-pointer"
+              className="w-full text-xs font-semibold text-red-600 hover:bg-red-50 border border-red-200 py-2.5 rounded-xl transition cursor-pointer"
             >
               Sign Out
             </button>
@@ -534,16 +658,16 @@ export default function Home() {
             <div className="flex items-center gap-3">
               <button
                 onClick={() => setMobileNavOpen(true)}
-                className="md:hidden bg-white border border-slate-200 px-3 py-2 rounded-xl text-sm shadow-sm"
+                className="md:hidden bg-white border border-pink-200 text-rose-700 px-3 py-2 rounded-xl text-sm shadow-sm"
               >
                 ☰
               </button>
               <div>
-                <h2 className="text-2xl font-bold text-slate-800">
+                <h2 className="text-2xl font-bold text-rose-950">
                   My Cloud Workspace
                 </h2>
-                <p className="text-xs text-slate-500">
-                  Signed in as {session.user.email}
+                <p className="text-xs text-rose-600/80">
+                  Max 5 files at once • 70 MB/file • 150 MB total
                 </p>
               </div>
             </div>
@@ -551,39 +675,117 @@ export default function Home() {
             <div className="flex flex-wrap items-center gap-2.5">
               <button
                 onClick={() => setShowFolderModal(true)}
-                className="bg-amber-100 hover:bg-amber-200 text-amber-800 text-xs font-semibold px-3.5 py-2.5 rounded-xl transition cursor-pointer"
+                className="bg-pink-100 hover:bg-pink-200 text-pink-800 text-xs font-semibold px-3.5 py-2.5 rounded-xl transition cursor-pointer"
               >
                 📁 New Folder
               </button>
               <button
                 onClick={() => setShowFileModal(true)}
-                className="bg-emerald-100 hover:bg-emerald-200 text-emerald-800 text-xs font-semibold px-3.5 py-2.5 rounded-xl transition cursor-pointer"
+                className="bg-rose-100 hover:bg-rose-200 text-rose-800 text-xs font-semibold px-3.5 py-2.5 rounded-xl transition cursor-pointer"
               >
                 ✍️ Create File
               </button>
-              <label className="bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-600 hover:to-indigo-700 text-white text-xs font-semibold px-4 py-2.5 rounded-xl shadow-sm cursor-pointer transition">
-                {uploading ? "Uploading..." : "⬆️ Upload File"}
+              <label className="bg-gradient-to-r from-pink-600 via-rose-600 to-red-600 hover:from-pink-700 hover:to-red-700 text-white text-xs font-semibold px-4 py-2.5 rounded-xl shadow-sm cursor-pointer transition">
+                {isUploadingAny ? "Uploading..." : "⬆️ Upload Files (Max 5)"}
                 <input
                   type="file"
+                  multiple
                   onChange={handleUpload}
                   className="hidden"
-                  disabled={uploading}
+                  disabled={isUploadingAny}
                 />
               </label>
             </div>
           </header>
 
+          {/* Upload Validation Error Banner */}
+          {uploadError && (
+            <div className="mb-5 bg-red-50 border border-red-200 text-red-700 text-xs font-medium px-4 py-3 rounded-2xl flex items-center justify-between">
+              <span>⚠️ {uploadError}</span>
+              <button
+                onClick={() => setUploadError("")}
+                className="text-red-500 hover:text-red-700 font-bold ml-3 cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
+          {/* Live Multi-File Upload Progress Panel */}
+          {uploadTasks.length > 0 && (
+            <div className="mb-6 bg-white/95 border border-pink-200 rounded-3xl p-5 shadow-sm">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-xs font-bold uppercase tracking-wide text-rose-700">
+                  {isUploadingAny
+                    ? `Uploading ${uploadTasks.length} file(s) simultaneously...`
+                    : "Upload Status"}
+                </h3>
+                {!isUploadingAny && (
+                  <button
+                    onClick={() => setUploadTasks([])}
+                    className="text-xs text-rose-500 hover:text-rose-700 font-semibold cursor-pointer"
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+
+              <div className="space-y-3">
+                {uploadTasks.map((task) => (
+                  <div
+                    key={task.id}
+                    className="bg-rose-50/60 border border-pink-100 rounded-2xl p-3"
+                  >
+                    <div className="flex justify-between items-center text-xs mb-1.5">
+                      <span className="font-semibold text-rose-900 truncate pr-3">
+                        📄 {task.name}{" "}
+                        <span className="text-rose-500 font-normal">
+                          ({formatBytes(task.size)})
+                        </span>
+                      </span>
+                      <span
+                        className={`font-bold shrink-0 ${
+                          task.status === "error"
+                            ? "text-red-600"
+                            : task.status === "done"
+                            ? "text-pink-600"
+                            : "text-rose-700"
+                        }`}
+                      >
+                        {task.status === "error"
+                          ? `Failed: ${task.error}`
+                          : task.status === "done"
+                          ? "100% ✓"
+                          : `${task.progress}%`}
+                      </span>
+                    </div>
+                    <div className="w-full bg-white h-2 rounded-full overflow-hidden border border-pink-200">
+                      <div
+                        className={`h-full transition-all duration-150 ${
+                          task.status === "error"
+                            ? "bg-red-500"
+                            : "bg-gradient-to-r from-pink-500 via-rose-500 to-red-500"
+                        }`}
+                        style={{ width: `${task.progress}%` }}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Breadcrumb Path Bar */}
-          <div className="flex items-center flex-wrap gap-1.5 bg-white/80 border border-indigo-100 rounded-2xl px-4 py-2.5 mb-6 text-sm shadow-xs">
+          <div className="flex items-center flex-wrap gap-1.5 bg-white/85 border border-pink-200 rounded-2xl px-4 py-2.5 mb-6 text-sm shadow-xs">
             {breadcrumbs.map((crumb, idx) => (
               <div key={crumb.id} className="flex items-center gap-1.5">
-                {idx > 0 && <span className="text-slate-400">/</span>}
+                {idx > 0 && <span className="text-rose-300">/</span>}
                 <button
                   onClick={() => navigateBreadcrumb(idx)}
                   className={`px-2 py-0.5 rounded-lg transition cursor-pointer ${
                     idx === breadcrumbs.length - 1
-                      ? "font-bold text-indigo-700 bg-indigo-50"
-                      : "text-slate-600 hover:bg-slate-100"
+                      ? "font-bold text-rose-700 bg-rose-100"
+                      : "text-rose-600 hover:bg-pink-50"
                   }`}
                 >
                   {idx === 0 ? "🏠 " : "📁 "}
@@ -594,8 +796,8 @@ export default function Home() {
           </div>
 
           {/* Files & Folders Table */}
-          <div className="bg-white/90 border border-indigo-100 rounded-3xl shadow-sm overflow-hidden">
-            <div className="grid grid-cols-12 px-5 py-3.5 bg-gradient-to-r from-sky-50/80 via-indigo-50/80 to-pink-50/80 border-b border-indigo-100 text-xs font-bold text-slate-500 uppercase">
+          <div className="bg-white/95 border border-pink-200 rounded-3xl shadow-sm overflow-hidden">
+            <div className="grid grid-cols-12 px-5 py-3.5 bg-gradient-to-r from-pink-50 via-rose-50 to-red-50 border-b border-pink-200 text-xs font-bold text-rose-700 uppercase">
               <div className="col-span-6">Name</div>
               <div className="col-span-2">Size</div>
               <div className="col-span-2">Created</div>
@@ -603,12 +805,12 @@ export default function Home() {
             </div>
 
             {loadingFiles ? (
-              <div className="p-10 text-center text-sm text-slate-400">
+              <div className="p-10 text-center text-sm text-rose-400">
                 Loading your private space...
               </div>
             ) : visibleItems.length === 0 ? (
-              <div className="p-10 text-center text-sm text-slate-400">
-                This folder is empty. Create a subfolder, write a file online, or upload one!
+              <div className="p-10 text-center text-sm text-rose-400">
+                This folder is empty. Create a subfolder, write a file online, or upload up to 5 files!
               </div>
             ) : (
               visibleItems.map((item) => {
@@ -616,13 +818,13 @@ export default function Home() {
                 return (
                   <div
                     key={item.id}
-                    className="grid grid-cols-12 items-center px-5 py-4 border-b border-slate-100 last:border-0 hover:bg-sky-50/40 transition text-sm"
+                    className="grid grid-cols-12 items-center px-5 py-4 border-b border-pink-100 last:border-0 hover:bg-rose-50/50 transition text-sm"
                   >
-                    <div className="col-span-6 font-medium text-slate-800 truncate pr-4">
+                    <div className="col-span-6 font-medium text-rose-950 truncate pr-4">
                       {isFolder ? (
                         <button
                           onClick={() => openFolder(item)}
-                          className="text-left hover:text-indigo-600 font-semibold flex items-center gap-2 cursor-pointer"
+                          className="text-left hover:text-red-600 font-semibold flex items-center gap-2 cursor-pointer"
                         >
                           <span className="text-lg">📁</span>
                           <span className="truncate">{item.name}</span>
@@ -634,10 +836,10 @@ export default function Home() {
                         </span>
                       )}
                     </div>
-                    <div className="col-span-2 text-slate-500 text-xs">
+                    <div className="col-span-2 text-rose-600/80 text-xs">
                       {isFolder ? "Folder" : formatBytes(item.size)}
                     </div>
-                    <div className="col-span-2 text-slate-500 text-xs">
+                    <div className="col-span-2 text-rose-600/80 text-xs">
                       {item.createdTime
                         ? new Date(item.createdTime).toLocaleDateString()
                         : "-"}
@@ -646,21 +848,21 @@ export default function Home() {
                       {isFolder ? (
                         <button
                           onClick={() => openFolder(item)}
-                          className="text-indigo-600 hover:underline text-xs font-semibold cursor-pointer"
+                          className="text-pink-600 hover:underline text-xs font-semibold cursor-pointer"
                         >
                           Open
                         </button>
                       ) : (
                         <button
                           onClick={() => handleDownload(item)}
-                          className="text-sky-600 hover:underline text-xs font-semibold cursor-pointer"
+                          className="text-rose-600 hover:underline text-xs font-semibold cursor-pointer"
                         >
                           Download
                         </button>
                       )}
                       <button
                         onClick={() => handleDelete(item)}
-                        className="text-rose-500 hover:underline text-xs font-semibold cursor-pointer"
+                        className="text-red-600 hover:underline text-xs font-semibold cursor-pointer"
                       >
                         Delete
                       </button>
@@ -674,20 +876,20 @@ export default function Home() {
       </div>
 
       {/* Footer */}
-      <footer className="w-full py-4 text-center text-xs font-semibold text-slate-500 border-t border-indigo-100/70 bg-white/60">
+      <footer className="w-full py-4 text-center text-xs font-semibold text-rose-500 border-t border-pink-200/80 bg-white/70">
         made with Love
       </footer>
 
       {/* Modal: Create Folder / Subfolder */}
       {showFolderModal && (
-        <div className="fixed inset-0 z-50 bg-slate-900/30 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="w-full max-w-md bg-white rounded-3xl p-6 shadow-xl border border-indigo-100">
-            <h3 className="text-lg font-bold text-slate-800 mb-1">
+        <div className="fixed inset-0 z-50 bg-rose-950/30 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-white rounded-3xl p-6 shadow-xl border border-pink-200">
+            <h3 className="text-lg font-bold text-rose-950 mb-1">
               📁 Create New Folder
             </h3>
-            <p className="text-xs text-slate-500 mb-4">
+            <p className="text-xs text-rose-600/80 mb-4">
               Will be created inside{" "}
-              <span className="font-semibold text-indigo-600">
+              <span className="font-semibold text-red-600">
                 {breadcrumbs[breadcrumbs.length - 1]?.name || "My Drive"}
               </span>
             </p>
@@ -699,20 +901,20 @@ export default function Home() {
                 value={newFolderName}
                 onChange={(e) => setNewFolderName(e.target.value)}
                 placeholder="e.g. College Notes, Photos, Work"
-                className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:border-indigo-400"
+                className="w-full bg-rose-50/50 border border-pink-200 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:border-rose-400"
               />
               <div className="flex justify-end gap-2">
                 <button
                   type="button"
                   onClick={() => setShowFolderModal(false)}
-                  className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-xl cursor-pointer"
+                  className="px-4 py-2 text-xs font-semibold text-rose-600 hover:bg-pink-50 rounded-xl cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={creatingFolder}
-                  className="px-4 py-2 text-xs font-semibold bg-gradient-to-r from-amber-400 to-orange-500 text-white rounded-xl shadow-sm cursor-pointer"
+                  className="px-4 py-2 text-xs font-semibold bg-gradient-to-r from-pink-500 to-red-500 text-white rounded-xl shadow-sm cursor-pointer"
                 >
                   {creatingFolder ? "Creating..." : "Create Folder"}
                 </button>
@@ -722,21 +924,21 @@ export default function Home() {
         </div>
       )}
 
-      {/* Modal: Create File Online (Any Extension + Paste Data) */}
+      {/* Modal: Create File Online */}
       {showFileModal && (
-        <div className="fixed inset-0 z-50 bg-slate-900/30 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="w-full max-w-xl bg-white rounded-3xl p-6 shadow-xl border border-indigo-100">
-            <h3 className="text-lg font-bold text-slate-800 mb-1">
+        <div className="fixed inset-0 z-50 bg-rose-950/30 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-xl bg-white rounded-3xl p-6 shadow-xl border border-pink-200">
+            <h3 className="text-lg font-bold text-rose-950 mb-1">
               ✍️ Create & Save File Online
             </h3>
-            <p className="text-xs text-slate-500 mb-4">
+            <p className="text-xs text-rose-600/80 mb-4">
               Type any filename with extension (like <code>notes.txt</code>,{" "}
               <code>index.html</code>, <code>code.py</code>, <code>data.json</code>)
               and paste your content below.
             </p>
             <form onSubmit={handleCreateFile} className="space-y-4">
               <div>
-                <label className="block text-xs font-semibold text-slate-600 mb-1">
+                <label className="block text-xs font-semibold text-rose-700 mb-1">
                   File Name & Extension
                 </label>
                 <input
@@ -746,11 +948,11 @@ export default function Home() {
                   value={newFileName}
                   onChange={(e) => setNewFileName(e.target.value)}
                   placeholder="example.txt"
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:border-emerald-400"
+                  className="w-full bg-rose-50/50 border border-pink-200 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:border-rose-400"
                 />
               </div>
               <div>
-                <label className="block text-xs font-semibold text-slate-600 mb-1">
+                <label className="block text-xs font-semibold text-rose-700 mb-1">
                   Paste or Type Data
                 </label>
                 <textarea
@@ -758,21 +960,21 @@ export default function Home() {
                   value={newFileContent}
                   onChange={(e) => setNewFileContent(e.target.value)}
                   placeholder="Paste your text, code, JSON, or notes here..."
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3.5 text-sm font-mono focus:outline-none focus:border-emerald-400"
+                  className="w-full bg-rose-50/50 border border-pink-200 rounded-xl p-3.5 text-sm font-mono focus:outline-none focus:border-rose-400"
                 />
               </div>
               <div className="flex justify-end gap-2">
                 <button
                   type="button"
                   onClick={() => setShowFileModal(false)}
-                  className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-xl cursor-pointer"
+                  className="px-4 py-2 text-xs font-semibold text-rose-600 hover:bg-pink-50 rounded-xl cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={creatingFile}
-                  className="px-5 py-2 text-xs font-semibold bg-gradient-to-r from-emerald-500 to-teal-500 text-white rounded-xl shadow-sm cursor-pointer"
+                  className="px-5 py-2 text-xs font-semibold bg-gradient-to-r from-rose-500 to-red-600 text-white rounded-xl shadow-sm cursor-pointer"
                 >
                   {creatingFile ? "Saving..." : "Save Online"}
                 </button>

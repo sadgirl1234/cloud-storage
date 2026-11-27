@@ -1,7 +1,7 @@
 import { google, drive_v3 } from "googleapis";
 import { createClient } from "@supabase/supabase-js";
 
-export function getDriveClient() {
+function createOAuthClient() {
   const oauth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
@@ -12,7 +12,18 @@ export function getDriveClient() {
     refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
   });
 
-  return google.drive({ version: "v3", auth: oauth2Client });
+  return oauth2Client;
+}
+
+export function getDriveClient() {
+  return google.drive({ version: "v3", auth: createOAuthClient() });
+}
+
+export async function getAccessToken(): Promise<string> {
+  const oauth2Client = createOAuthClient();
+  const { token } = await oauth2Client.getAccessToken();
+  if (!token) throw new Error("Failed to get Google access token");
+  return token;
 }
 
 export async function getAuthenticatedUser(req: Request) {
@@ -58,7 +69,6 @@ export async function getOrCreateUserFolder(email: string) {
   return created.data.id!;
 }
 
-// Walks up parent folders to verify an item belongs strictly to this user
 export async function isInsideUserFolder(
   drive: drive_v3.Drive,
   itemId: string,
