@@ -1,49 +1,74 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
-type UploadedFile = {
+type DriveFile = {
   id: string;
   name: string;
-  size: string;
-  date: string;
+  size?: string;
+  createdTime?: string;
 };
 
+function formatBytes(bytes?: string) {
+  const num = Number(bytes || 0);
+  if (num === 0) return "0 B";
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(num) / Math.log(1024));
+  return `${(num / Math.pow(1024, i)).toFixed(2)} ${sizes[i]}`;
+}
+
 export default function Home() {
-  const [files, setFiles] = useState<UploadedFile[]>([
-    { id: "1", name: "Resume_2026.pdf", size: "1.4 MB", date: "Today" },
-    { id: "2", name: "Project_Backup.zip", size: "42.8 MB", date: "Yesterday" },
-  ]);
+  const [files, setFiles] = useState<DriveFile[]>([]);
+  const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
 
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const fetchFiles = async () => {
+    setLoading(true);
+    const res = await fetch("/api/files");
+    const data = await res.json();
+    setFiles(data.files || []);
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    fetchFiles();
+  }, []);
+
+  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = e.target.files?.[0];
     if (!selected) return;
 
     setUploading(true);
-    // Temporary preview until connected to Google Drive / Supabase API
-    setTimeout(() => {
-      const sizeInMB = (selected.size / (1024 * 1024)).toFixed(2) + " MB";
-      setFiles((prev) => [
-        {
-          id: crypto.randomUUID(),
-          name: selected.name,
-          size: sizeInMB,
-          date: "Just now",
-        },
-        ...prev,
-      ]);
-      setUploading(false);
-    }, 500);
+    const formData = new FormData();
+    formData.append("file", selected);
+
+    const res = await fetch("/api/files", {
+      method: "POST",
+      body: formData,
+    });
+
+    if (res.ok) {
+      await fetchFiles();
+    } else {
+      alert("Upload failed. Check your .env.local keys and terminal logs.");
+    }
+    setUploading(false);
+    e.target.value = "";
   };
 
-  const handleDelete = (id: string) => {
-    setFiles((prev) => prev.filter((f) => f.id !== id));
+  const handleDelete = async (id: string) => {
+    const res = await fetch(`/api/files/${id}`, { method: "DELETE" });
+    if (res.ok) {
+      setFiles((prev) => prev.filter((f) => f.id !== id));
+    }
   };
+
+  const totalBytes = files.reduce((sum, f) => sum + Number(f.size || 0), 0);
+  const usedGB = (totalBytes / 1024 ** 3).toFixed(2);
+  const usedPercent = Math.min((totalBytes / (15 * 1024 ** 3)) * 100, 100);
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 flex">
-      {/* Sidebar */}
       <aside className="w-64 border-r border-zinc-800 p-6 hidden md:flex flex-col justify-between">
         <div>
           <h1 className="text-xl font-bold tracking-tight text-white mb-8">
@@ -53,28 +78,23 @@ export default function Home() {
             <div className="bg-zinc-800/80 text-white px-3 py-2 rounded-lg font-medium">
               My Drive
             </div>
-            <div className="text-zinc-400 hover:text-white px-3 py-2 rounded-lg cursor-pointer">
-              Recent Uploads
-            </div>
-            <div className="text-zinc-400 hover:text-white px-3 py-2 rounded-lg cursor-pointer">
-              Shared Files
-            </div>
           </nav>
         </div>
 
-        {/* Storage Meter */}
         <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
           <div className="flex justify-between text-xs text-zinc-400 mb-2">
             <span>Storage Used</span>
-            <span>0.05 GB / 15 GB</span>
+            <span>{usedGB} GB / 15 GB</span>
           </div>
           <div className="w-full bg-zinc-800 h-2 rounded-full overflow-hidden">
-            <div className="bg-blue-500 h-full w-[5%]" />
+            <div
+              className="bg-blue-500 h-full transition-all"
+              style={{ width: `${Math.max(usedPercent, 2)}%` }}
+            />
           </div>
         </div>
       </aside>
 
-      {/* Main Content */}
       <main className="flex-1 p-6 md:p-10 max-w-5xl mx-auto w-full">
         <header className="flex justify-between items-center mb-8">
           <div>
@@ -88,30 +108,13 @@ export default function Home() {
             {uploading ? "Uploading..." : "+ Upload File"}
             <input
               type="file"
-              onChange={handleFileSelect}
+              onChange={handleUpload}
               className="hidden"
               disabled={uploading}
             />
           </label>
         </header>
 
-        {/* Dropzone Banner */}
-        <label className="border-2 border-dashed border-zinc-800 hover:border-blue-500/60 bg-zinc-900/40 rounded-2xl p-8 mb-8 flex flex-col items-center justify-center text-center cursor-pointer transition">
-          <p className="text-sm font-medium text-zinc-200">
-            Click to choose a file from your device
-          </p>
-          <p className="text-xs text-zinc-500 mt-1">
-            Supports images, videos, PDFs, and archives
-          </p>
-          <input
-            type="file"
-            onChange={handleFileSelect}
-            className="hidden"
-            disabled={uploading}
-          />
-        </label>
-
-        {/* File Table */}
         <div className="bg-zinc-900/60 border border-zinc-800 rounded-2xl overflow-hidden">
           <div className="grid grid-cols-12 px-5 py-3 border-b border-zinc-800 text-xs font-medium text-zinc-400 uppercase">
             <div className="col-span-6">File Name</div>
@@ -120,9 +123,13 @@ export default function Home() {
             <div className="col-span-2 text-right">Actions</div>
           </div>
 
-          {files.length === 0 ? (
+          {loading ? (
             <div className="p-8 text-center text-sm text-zinc-500">
-              No files uploaded yet.
+              Loading files...
+            </div>
+          ) : files.length === 0 ? (
+            <div className="p-8 text-center text-sm text-zinc-500">
+              No files uploaded yet. Click &quot;+ Upload File&quot; to test.
             </div>
           ) : (
             files.map((file) => (
@@ -133,12 +140,21 @@ export default function Home() {
                 <div className="col-span-6 font-medium text-zinc-100 truncate pr-4">
                   📄 {file.name}
                 </div>
-                <div className="col-span-2 text-zinc-400">{file.size}</div>
-                <div className="col-span-2 text-zinc-400">{file.date}</div>
+                <div className="col-span-2 text-zinc-400">
+                  {formatBytes(file.size)}
+                </div>
+                <div className="col-span-2 text-zinc-400">
+                  {file.createdTime
+                    ? new Date(file.createdTime).toLocaleDateString()
+                    : "-"}
+                </div>
                 <div className="col-span-2 text-right space-x-3">
-                  <button className="text-blue-400 hover:underline text-xs">
+                  <a
+                    href={`/api/files/${file.id}`}
+                    className="text-blue-400 hover:underline text-xs"
+                  >
                     Download
-                  </button>
+                  </a>
                   <button
                     onClick={() => handleDelete(file.id)}
                     className="text-red-400 hover:underline text-xs"
