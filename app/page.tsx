@@ -26,11 +26,6 @@ function formatBytes(bytes?: string) {
 export default function Home() {
   const [session, setSession] = useState<Session | null>(null);
   const [authReady, setAuthReady] = useState(false);
-
-  // Login / Sign Up form state
-  const [isSignUp, setIsSignUp] = useState(false);
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
   const [authMessage, setAuthMessage] = useState("");
   const [authLoading, setAuthLoading] = useState(false);
 
@@ -72,43 +67,23 @@ export default function Home() {
     return () => listener.subscription.unsubscribe();
   }, [fetchFiles]);
 
-  const handleAuth = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleGoogleLogin = async () => {
     setAuthLoading(true);
     setAuthMessage("");
-
-    if (isSignUp) {
-      const { data, error } = await supabase.auth.signUp({ email, password });
-      if (error) {
-        setAuthMessage(error.message);
-      } else if (!data.session) {
-        setAuthMessage(
-          "Account created! Check your email to confirm, then log in."
-        );
-      }
-    } else {
-      const { error } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      });
-      if (error) setAuthMessage(error.message);
-    }
-
-    setAuthLoading(false);
-  };
-
-  const handleSignOut = async () => {
-    await supabase.auth.signOut();
-  };
-
-  const handleGoogleLogin = async () => {
     const { error } = await supabase.auth.signInWithOAuth({
       provider: "google",
       options: {
         redirectTo: window.location.origin,
       },
     });
-    if (error) setAuthMessage(error.message);
+    if (error) {
+      setAuthMessage(error.message);
+      setAuthLoading(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
   };
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -171,75 +146,27 @@ export default function Home() {
     );
   }
 
-  // Login / Create Account screen
+  // Google-only Login screen
   if (!session) {
     return (
       <div className="min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center p-4">
-        <div className="w-full max-w-md bg-zinc-900 border border-zinc-800 rounded-2xl p-8">
+        <div className="w-full max-w-md bg-zinc-900 border border-zinc-800 rounded-2xl p-8 text-center">
           <h1 className="text-2xl font-bold text-white mb-2">☁️ CloudVault</h1>
-          <p className="text-sm text-zinc-400 mb-6">
-            {isSignUp
-              ? "Create a private account to get your own cloud folder"
-              : "Sign in to access your private files"}
+          <p className="text-sm text-zinc-400 mb-8">
+            Sign in with your Google account to access your private cloud storage
           </p>
 
-          <form onSubmit={handleAuth} className="space-y-4">
-            <div>
-              <label className="block text-xs text-zinc-400 mb-1">Email</label>
-              <input
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="you@gmail.com"
-                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs text-zinc-400 mb-1">
-                Password
-              </label>
-              <input
-                type="password"
-                required
-                minLength={6}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="••••••••"
-                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
-              />
-            </div>
-
-            {authMessage && (
-              <p className="text-xs text-amber-400 bg-amber-950/40 border border-amber-800/60 rounded-lg p-3">
-                {authMessage}
-              </p>
-            )}
-
-            <button
-              type="submit"
-              disabled={authLoading}
-              className="w-full bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium py-2.5 rounded-lg transition"
-            >
-              {authLoading
-                ? "Please wait..."
-                : isSignUp
-                ? "Create Account"
-                : "Sign In"}
-            </button>
-          </form>
-
-          <div className="my-5 flex items-center gap-3">
-            <div className="h-px flex-1 bg-zinc-800" />
-            <span className="text-xs text-zinc-500">OR</span>
-            <div className="h-px flex-1 bg-zinc-800" />
-          </div>
+          {authMessage && (
+            <p className="text-xs text-amber-400 bg-amber-950/40 border border-amber-800/60 rounded-lg p-3 mb-4">
+              {authMessage}
+            </p>
+          )}
 
           <button
             type="button"
+            disabled={authLoading}
             onClick={handleGoogleLogin}
-            className="w-full bg-white hover:bg-zinc-200 text-zinc-900 text-sm font-medium py-2.5 rounded-lg flex items-center justify-center gap-2 transition"
+            className="w-full bg-white hover:bg-zinc-200 disabled:opacity-60 text-zinc-900 text-sm font-medium py-3 rounded-lg flex items-center justify-center gap-2.5 transition"
           >
             <svg className="w-4 h-4" viewBox="0 0 24 24">
               <path
@@ -259,19 +186,7 @@ export default function Home() {
                 d="M12.255 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C18.205 1.19 15.495 0 12.255 0c-4.69 0-8.74 2.7-10.71 6.62l3.98 3.09c.95-2.85 3.6-4.96 6.73-4.96z"
               />
             </svg>
-            Continue with Google
-          </button>
-
-          <button
-            onClick={() => {
-              setIsSignUp(!isSignUp);
-              setAuthMessage("");
-            }}
-            className="w-full text-center text-xs text-zinc-400 hover:text-white mt-5"
-          >
-            {isSignUp
-              ? "Already have an account? Sign In"
-              : "Don't have an account? Create Account"}
+            {authLoading ? "Redirecting..." : "Continue with Google"}
           </button>
         </div>
       </div>
